@@ -1,0 +1,881 @@
+# -*- coding: utf-8 -*-
+"""Veil: a private window. Screen-capture APIs skip it, and it has no taskbar button.
+
+Run with pythonw.exe (the desktop shortcut does this). Ctrl+Alt+V hides and shows it.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+import sys
+import threading
+import traceback
+from ctypes import wintypes
+from pathlib import Path
+from urllib.parse import quote
+
+APP = Path(os.environ.get("APPDATA", str(Path.home()))) / "Veil"
+NOTES = APP / "notes.txt"
+LOG = APP / "veil.log"
+MUTEX_NAME = "Local\\VeilPrivateWindow"
+WINDOW_TITLE = "Veil"
+
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
+WM_HOTKEY = 0x0312
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_NOREPEAT = 0x4000
+EM_SETCUEBANNER = 0x1501
+ERROR_ALREADY_EXISTS = 183
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_uint8 * 8),
+    ]
+
+
+def _bind():
+    user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+    user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+    user32.SetWindowPos.argtypes = [
+        wintypes.HWND,
+        wintypes.HWND,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        wintypes.UINT,
+    ]
+    user32.SetWindowPos.restype = wintypes.BOOL
+    user32.SetWindowDisplayAffinity.argtypes = [wintypes.HWND, wintypes.DWORD]
+    user32.SetWindowDisplayAffinity.restype = wintypes.BOOL
+    user32.GetWindowDisplayAffinity.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowDisplayAffinity.restype = wintypes.BOOL
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumChildWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowW.restype = wintypes.HWND
+    user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+    user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG),
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPCWSTR]
+    user32.SendMessageW.restype = ctypes.c_ssize_t
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+    kernel32.GetConsoleWindow.restype = wintypes.HWND
+    ole32.CLSIDFromString.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(GUID)]
+    ole32.CLSIDFromString.restype = ctypes.c_long
+    ole32.CoInitialize.argtypes = [ctypes.c_void_p]
+    ole32.CoInitialize.restype = ctypes.c_long
+    ole32.CoCreateInstance.argtypes = [
+        ctypes.POINTER(GUID),
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(GUID),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    ole32.CoCreateInstance.restype = ctypes.c_long
+
+
+_bind()
+
+_mutex = None
+_delete_tab = None
+_tab_failed = False
+_form = None
+_window = None
+_page_html = ""
+_refs = []
+_chosen_hotkey = "Ctrl+Alt+V"
+_test = os.environ.get("VEIL_TEST") == "1"
+
+
+def log(message):
+    try:
+        APP.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as handle:
+            handle.write(message.rstrip() + "\n")
+    except Exception:
+        pass
+
+
+def as_hwnd(value):
+    if hasattr(value, "ToInt64"):
+        value = value.ToInt64()
+    return int(value) & ((1 << 64) - 1)
+
+
+def hide_console():
+    console = kernel32.GetConsoleWindow()
+    if console:
+        user32.SetWindowDisplayAffinity(console, WDA_EXCLUDEFROMCAPTURE)
+        user32.ShowWindow(console, 0)
+
+
+def focus_existing():
+    for _ in range(30):
+        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+        if hwnd:
+            user32.ShowWindow(hwnd, 5)
+            user32.SetForegroundWindow(hwnd)
+            return
+        threading.Event().wait(0.1)
+
+
+def claim_single_instance():
+    global _mutex
+    _mutex = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        focus_existing()
+        sys.exit(0)
+
+
+def _make_guid(text):
+    guid = GUID()
+    if ole32.CLSIDFromString(text, ctypes.byref(guid)) != 0:
+        raise OSError("bad guid")
+    return guid
+
+
+def taskbar_delete():
+    global _delete_tab, _tab_failed
+    if _delete_tab is not None or _tab_failed:
+        return _delete_tab
+
+    try:
+        ole32.CoInitialize(None)
+        clsid = _make_guid("{56FDF344-FD6D-11d0-958A-006097C9A090}")
+        iid = _make_guid("{56FDF342-FD6D-11d0-958A-006097C9A090}")
+        com = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(com))
+        if hr != 0 or not com.value:
+            raise OSError("CoCreateInstance 0x%08X" % (hr & 0xFFFFFFFF))
+        vtable = ctypes.cast(
+            ctypes.cast(com, ctypes.POINTER(ctypes.c_void_p))[0],
+            ctypes.POINTER(ctypes.c_void_p),
+        )
+        hr_init = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)(vtable[3])
+        delete = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, wintypes.HWND)(vtable[5])
+        if hr_init(com) != 0:
+            raise OSError("ITaskbarList.HrInit failed")
+
+        def _call(hwnd):
+            return delete(com, hwnd)
+
+        _delete_tab = _call
+        log("taskbar DeleteTab ready")
+    except Exception:
+        _tab_failed = True
+        log(traceback.format_exc())
+        return None
+    return _delete_tab
+
+
+def shield(hwnd):
+    if not hwnd:
+        return False
+    return bool(user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+
+
+def class_name(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def child_hwnds(parent):
+    found = []
+
+    def _cb(hwnd, _lp):
+        found.append(as_hwnd(hwnd))
+        return True
+
+    callback = WNDENUMPROC(_cb)
+    user32.EnumChildWindows(parent, callback, 0)
+    return found
+
+
+def ensure_toolwindow(hwnd):
+    ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF
+    updated = (ex | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+    if updated != ex:
+        user32.SetWindowLongPtrW(hwnd, GWL_EXSTYLE, updated)
+        user32.SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        )
+    return updated
+
+
+def conceal(hwnd):
+    ensure_toolwindow(hwnd)
+    delete = taskbar_delete()
+    if delete:
+        delete(hwnd)
+
+
+def shield_all(force_tab=False):
+    pid = kernel32.GetCurrentProcessId()
+    tops = []
+
+    def _cb(hwnd, _lp):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid:
+            tops.append(as_hwnd(hwnd))
+        return True
+
+    callback = WNDENUMPROC(_cb)
+    user32.EnumWindows(callback, 0)
+    for hwnd in tops:
+        shield(hwnd)
+        for child in child_hwnds(hwnd):
+            shield(child)
+        if user32.IsWindowVisible(hwnd) and class_name(hwnd).startswith("WindowsForms"):
+            ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF
+            drifted = (ex & WS_EX_TOOLWINDOW) == 0 or (ex & WS_EX_APPWINDOW) != 0
+            if drifted or force_tab:
+                conceal(hwnd)
+
+
+def write_ready():
+    if not _test or _form is None:
+        return
+    try:
+        hwnd = as_hwnd(_form.Handle)
+        affinity = wintypes.DWORD()
+        user32.GetWindowDisplayAffinity(hwnd, ctypes.byref(affinity))
+        ex = user32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & 0xFFFFFFFF
+        path = Path(os.environ.get("TEMP", ".")) / "veil-ready.txt"
+        path.write_text(
+            "pid=%s\nhwnd=%s\naffinity=%s\nexstyle=%s\ntab=%s\n"
+            % (os.getpid(), hwnd, int(affinity.value), ex, "fail" if _tab_failed else "ok"),
+            encoding="utf-8",
+        )
+    except Exception:
+        log(traceback.format_exc())
+
+
+def normalize_url(raw):
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        return text
+    if " " in text or "." not in text:
+        return "https://www.google.com/search?q=" + quote(text)
+    return "https://" + text
+
+
+HOME_HTML = """<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #14161c;
+    --card: #1c1f27;
+    --ink: #ece7dc;
+    --muted: #9a958a;
+    --line: #31363f;
+    --brass: #e0b15a;
+    --ok: #8fceab;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); font-family: "Segoe UI", sans-serif; }
+  .wrap {
+    height: 100%; display: flex; flex-direction: column; overflow: auto;
+    padding: clamp(12px, 3vw, 22px); gap: clamp(8px, 2vw, 12px);
+  }
+  .kicker { color: var(--brass); letter-spacing: .14em; font-size: clamp(10px, 2vw, 11px); }
+  h1 { font-size: clamp(18px, 4.4vw, 28px); font-weight: 600; margin: 2px 0 0; letter-spacing: -0.03em; }
+  .status { color: var(--ok); font-size: clamp(12.5px, 2.5vw, 14px); line-height: 1.45; margin-top: 8px; }
+  .hint { color: var(--muted); font-size: clamp(12px, 2.4vw, 13.5px); line-height: 1.5; margin: 8px 0 0; }
+  kbd { font-family: Consolas, monospace; background: #2a2e38; border: 1px solid #3c4250; border-radius: 4px; padding: 1px 6px; color: var(--ink); }
+  textarea {
+    flex: 1 1 auto; width: 100%; min-height: 96px; resize: none; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); border-radius: 12px; padding: clamp(10px, 2vw, 16px);
+    font: clamp(14px, 2.6vw, 16px)/1.5 "Segoe UI", sans-serif; outline: none;
+  }
+  @media (max-height: 560px) {
+    h1 { font-size: 18px; }
+    .status, .hint { margin-top: 4px; }
+    textarea { min-height: 72px; }
+  }
+  textarea:focus { border-color: #8a7040; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button.link {
+    background: transparent; color: var(--ink); border: 1px solid var(--line);
+    border-radius: 999px; padding: 7px 12px; font: 13px "Segoe UI"; cursor: pointer;
+  }
+  button.link:hover { border-color: var(--brass); color: var(--brass); }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div>
+      <div class="kicker">PRIVATE WINDOW</div>
+      <h1>Sirf tumhari screen par</h1>
+      <div class="status">Meeting ki screen share is window ko skip karti hai. Taskbar par button nahi. Alt+Tab mein nahi.</div>
+      <p class="hint">Chhupane aur wapas laane ke liye <kbd>__HOTKEY__</kbd>. Upar wali patti mein koi bhi site ya search likho. Notes neeche khud likho.</p>
+    </div>
+    <textarea id="notes" spellcheck="false" placeholder="Meeting notes yahan likho."></textarea>
+    <div class="row">
+      <button class="link" data-url="https://chatgpt.com">ChatGPT</button>
+      <button class="link" data-url="https://www.google.com">Google</button>
+      <button class="link" data-url="https://mail.google.com">Gmail</button>
+      <button class="link" data-url="https://gemini.google.com">Gemini</button>
+      
+      
+    </div>
+  </div>
+  <script>
+    const notes = document.getElementById("notes");
+    let timer = null;
+    function whenReady(fn) {
+      if (window.pywebview && window.pywebview.api) fn();
+      else window.addEventListener("pywebviewready", fn);
+    }
+    whenReady(async () => {
+      try { notes.value = await window.pywebview.api.load_notes(); } catch (e) {}
+      notes.addEventListener("input", () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => window.pywebview.api.save_notes(notes.value), 250);
+      });
+    });
+    document.querySelectorAll("button.link").forEach((button) => {
+      button.addEventListener("click", () => window.pywebview.api.go(button.dataset.url));
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+class Api:
+    def load_notes(self):
+        try:
+            return NOTES.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+        except Exception:
+            log(traceback.format_exc())
+            return ""
+
+    def save_notes(self, text):
+        try:
+            if not isinstance(text, str):
+                text = str(text)
+            text = text[:2_000_000]
+            NOTES.parent.mkdir(parents=True, exist_ok=True)
+            temp = NOTES.with_suffix(".tmp")
+            temp.write_text(text, encoding="utf-8")
+            temp.replace(NOTES)
+            return True
+        except Exception:
+            log(traceback.format_exc())
+            return False
+
+    def go(self, url):
+        target = normalize_url(url)
+        if target and _window is not None:
+            _window.load_url(target)
+        return True
+
+
+def navigate(url=None):
+    form = _form
+    if form is None:
+        return
+    target = normalize_url(url if url is not None else form._veil_box.Text)
+    if not target:
+        return
+    try:
+        core = form.webview.CoreWebView2
+        if core is None:
+            threading.Thread(target=lambda: _window.load_url(target), daemon=True).start()
+        else:
+            core.Navigate(target)
+        form._veil_box.Text = target
+    except Exception:
+        log(traceback.format_exc())
+
+
+def _ui_scale(form):
+    try:
+        return max(1.0, float(form.DeviceDpi) / 96.0)
+    except Exception:
+        return 1.0
+
+
+def layout_bar(*_):
+    form = _form
+    if form is None or getattr(form, "_veil_laying", False):
+        return
+    panel = form._veil_panel
+    width = int(panel.ClientSize.Width)
+    if width < 80:
+        return
+    scale = _ui_scale(form)
+
+    def px(value):
+        return max(1, int(round(value * scale)))
+
+    pad = px(8)
+    gap = px(6)
+    row_h = px(32)
+    back_w = px(36)
+    go_w = px(48)
+    home_w = px(62)
+    pin_w = px(68)
+    hide_w = px(58)
+    url_min = px(128)
+    one_row = (
+        pad * 2 + back_w + go_w + home_w + pin_w + hide_w + gap * 5 + url_min
+    )
+    two_rows = width < one_row
+    form._veil_laying = True
+    try:
+        panel.Height = (pad * 2 + row_h) if not two_rows else (pad * 2 + row_h * 2 + gap)
+        back = form._veil_back
+        box = form._veil_box
+        go = form._veil_go
+        home = form._veil_home
+        pin = form._veil_pin
+        hide = form._veil_hide
+        if two_rows:
+            back.SetBounds(pad, pad, back_w, row_h)
+            go_x = width - pad - go_w
+            go.SetBounds(go_x, pad, go_w, row_h)
+            url_left = pad + back_w + gap
+            box.SetBounds(url_left, pad + px(2), max(px(48), go_x - gap - url_left), row_h - px(4))
+            second = pad + row_h + gap
+            hide_x = width - pad - hide_w
+            hide.SetBounds(hide_x, second, hide_w, row_h)
+            pin_x = hide_x - gap - pin_w
+            pin.SetBounds(pin_x, second, pin_w, row_h)
+            home.SetBounds(pin_x - gap - home_w, second, home_w, row_h)
+        else:
+            back.SetBounds(pad, pad, back_w, row_h)
+            right = width - pad
+            for button, button_w in ((hide, hide_w), (pin, pin_w), (home, home_w), (go, go_w)):
+                right -= button_w
+                button.SetBounds(right, pad, button_w, row_h)
+                right -= gap
+            url_left = pad + back_w + gap
+            box.SetBounds(url_left, pad + px(2), max(px(48), right - url_left), row_h - px(4))
+    finally:
+        form._veil_laying = False
+
+
+def paint_button(button, label):
+    import System.Windows.Forms as WinForms
+    from System.Drawing import Color
+
+    button.Text = label
+    button.FlatStyle = WinForms.FlatStyle.Flat
+    button.FlatAppearance.BorderSize = 0
+    button.BackColor = Color.FromArgb(255, 36, 34, 30)
+    button.ForeColor = Color.FromArgb(255, 236, 228, 210)
+    button.Cursor = WinForms.Cursors.Hand
+    button.TabStop = False
+    button.Font = _form._veil_font
+    return button
+
+
+def arm():
+    global _form
+    import System.Windows.Forms as WinForms
+    from System.Drawing import Color, Font
+
+    form = _form
+    font = Font("Segoe UI", 9.0)
+    form._veil_font = font
+    form.BackColor = Color.FromArgb(255, 20, 21, 26)
+
+    panel = WinForms.Panel()
+    panel.Height = 48
+    panel.Dock = WinForms.DockStyle.Top
+    panel.BackColor = Color.FromArgb(255, 20, 21, 26)
+    form.Controls.Add(panel)
+    panel.BringToFront()
+
+    box = WinForms.TextBox()
+    box.BorderStyle = WinForms.BorderStyle.FixedSingle
+    box.BackColor = Color.FromArgb(255, 16, 17, 22)
+    box.ForeColor = Color.FromArgb(255, 236, 231, 220)
+    box.Font = font
+    box.AutoSize = False
+
+    def on_enter(sender, args):
+        if args.KeyCode == WinForms.Keys.Enter:
+            args.SuppressKeyPress = True
+            args.Handled = True
+            navigate()
+
+    box.KeyDown += on_enter
+
+    back = WinForms.Button()
+    go = WinForms.Button()
+    home = WinForms.Button()
+    pin = WinForms.Button()
+    hide = WinForms.Button()
+    for button, label in (
+        (back, "←"),
+        (go, "Go"),
+        (home, "Home"),
+        (pin, "Unpin"),
+        (hide, "Hide"),
+    ):
+        paint_button(button, label)
+        panel.Controls.Add(button)
+    panel.Controls.Add(box)
+
+    def on_go(sender, args):
+        navigate()
+
+    def on_home(sender, args):
+        box.Text = ""
+        try:
+            form.browser.load_html(_page_html, None)
+        except Exception:
+            log(traceback.format_exc())
+
+    def on_back(sender, args):
+        try:
+            if form.webview.CanGoBack:
+                form.webview.GoBack()
+        except Exception:
+            log(traceback.format_exc())
+
+    def on_pin(sender, args):
+        form.TopMost = not form.TopMost
+        pin.Text = "Unpin" if form.TopMost else "Pin"
+
+    def on_hide(sender, args):
+        form.Hide()
+
+    def on_navigated(sender, args):
+        try:
+            source = form.webview.Source
+            if source is None:
+                return
+            uri = str(source.AbsoluteUri)
+        except Exception:
+            return
+        if uri.startswith(("about:", "http://127.", "http://localhost")):
+            return
+        box.Text = uri
+
+    go.Click += on_go
+    home.Click += on_home
+    back.Click += on_back
+    pin.Click += on_pin
+    hide.Click += on_hide
+    form._veil_panel = panel
+    form._veil_box = box
+    form._veil_back = back
+    form._veil_go = go
+    form._veil_home = home
+    form._veil_pin = pin
+    form._veil_hide = hide
+    panel.Resize += layout_bar
+    form.webview.NavigationCompleted += on_navigated
+    _refs.extend([
+        panel, box, back, go, home, pin, hide, font,
+        on_enter, on_go, on_home, on_back, on_pin, on_hide, on_navigated,
+    ])
+
+    try:
+        user32.SendMessageW(as_hwnd(box.Handle), EM_SETCUEBANNER, 1, "Site ya search — kuch bhi")
+    except Exception:
+        log(traceback.format_exc())
+
+    tip = WinForms.ToolTip()
+    tip.SetToolTip(hide, _chosen_hotkey + " se wapas aayega")
+    _refs.append(tip)
+
+    if _test:
+        swatch = WinForms.Panel()
+        swatch.BackColor = Color.FromArgb(255, 255, 43, 214)
+        swatch.Dock = WinForms.DockStyle.Fill
+        form.Controls.Add(swatch)
+        swatch.BringToFront()
+        panel.BringToFront()
+        _refs.append(swatch)
+
+    def on_resize_end(sender, args):
+        save_window_bounds(form)
+
+    form.ResizeEnd += on_resize_end
+    _refs.append(on_resize_end)
+    layout_bar()
+    form.TopMost = True
+    shield_all(force_tab=True)
+
+    ticks = {"n": 0}
+
+    def on_tick(sender, args):
+        ticks["n"] += 1
+        try:
+            shield_all(force_tab=ticks["n"] <= 10)
+            write_ready()
+        except Exception:
+            log(traceback.format_exc())
+
+    timer = WinForms.Timer()
+    timer.Interval = 700
+    timer.Tick += on_tick
+    timer.Start()
+    _refs.append(timer)
+    write_ready()
+    log("window armed")
+
+
+def toggle():
+    form = _form
+    if form is None or not form.IsHandleCreated:
+        return
+    if form.Visible:
+        form.Hide()
+        return
+    import System.Windows.Forms as WinForms
+
+    form.Show()
+    form.WindowState = WinForms.FormWindowState.Normal
+    form.TopMost = True
+    form.Activate()
+    try:
+        shield_all(force_tab=True)
+    except Exception:
+        log(traceback.format_exc())
+
+
+def hotkey_loop():
+    global _chosen_hotkey
+
+    combos = (
+        (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x56, "Ctrl+Alt+V"),
+        (MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 0x56, "Ctrl+Shift+V"),
+        (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 0x20, "Ctrl+Alt+Space"),
+    )
+    registered = False
+    for mods, vk, label in combos:
+        if user32.RegisterHotKey(None, 1, mods, vk):
+            _chosen_hotkey = label
+            registered = True
+            log("hotkey " + label)
+            break
+    if not registered:
+        log("hotkey registration failed")
+    hotkey_ready.set()
+    message = wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(message), None, 0, 0) != 0:
+        if message.message == WM_HOTKEY:
+            form = _form
+            if form is not None and form.IsHandleCreated:
+                try:
+                    from System import Action
+
+                    form.BeginInvoke(Action(toggle))
+                except Exception:
+                    log(traceback.format_exc())
+        user32.TranslateMessage(ctypes.byref(message))
+        user32.DispatchMessageW(ctypes.byref(message))
+
+
+hotkey_ready = threading.Event()
+
+
+def on_shown():
+    global _form
+    from System import Action
+
+    _form = _window.native
+    try:
+        _form.BeginInvoke(Action(arm))
+    except Exception:
+        log(traceback.format_exc())
+
+
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+
+
+def work_area():
+    rect = _RECT()
+    try:
+        user32.SystemParametersInfoW.argtypes = [
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.c_void_p,
+            wintypes.UINT,
+        ]
+        user32.SystemParametersInfoW.restype = wintypes.BOOL
+        if user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+            return rect.left, rect.top, rect.right, rect.bottom
+    except Exception:
+        log(traceback.format_exc())
+    return 0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+
+
+def read_saved_window():
+    try:
+        mode, x, y, width, height = (APP / "window.txt").read_text(encoding="utf-8").split()
+        return mode, int(float(x)), int(float(y)), int(float(width)), int(float(height))
+    except Exception:
+        return None
+
+
+def save_window_bounds(form):
+    if _test:
+        return
+    try:
+        state = int(form.WindowState)
+        if state == 1:
+            return
+        scale = _ui_scale(form)
+        rect = form.RestoreBounds if state == 2 else form.Bounds
+        (APP / "window.txt").write_text(
+            "%s %d %d %d %d\n"
+            % (
+                "max" if state == 2 else "normal",
+                int(rect.X / scale),
+                int(rect.Y / scale),
+                int(rect.Width / scale),
+                int(rect.Height / scale),
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        log(traceback.format_exc())
+
+
+def place_window():
+    if _test:
+        return 80, 48, 640, 420, False
+    left, top, right, bottom = work_area()
+    area_w = max(320, right - left)
+    area_h = max(320, bottom - top)
+    saved = read_saved_window()
+    if saved:
+        mode, x, y, width, height = saved
+        width = min(max(320, width), area_w)
+        height = min(max(360, height), area_h)
+        x = min(max(left, x), left + area_w - width)
+        y = min(max(top, y), top + area_h - height)
+        return x, y, width, height, mode == "max"
+    width = min(520, max(360, int(area_w * 0.36)))
+    height = min(max(420, int(area_h * 0.86)), area_h - 8)
+    x = left + max(0, area_w - width - 12)
+    y = top + min(12, max(0, area_h - height))
+    return x, y, width, height, False
+
+
+def main():
+    global _window, _page_html
+    hide_console()
+    claim_single_instance()
+    log("--- start pid %s test %s ---" % (os.getpid(), _test))
+    APP.mkdir(parents=True, exist_ok=True)
+    (APP / "webview").mkdir(parents=True, exist_ok=True)
+
+    threading.Thread(target=hotkey_loop, name="veil-hotkey", daemon=True).start()
+    hotkey_ready.wait(2)
+    _page_html = HOME_HTML.replace("__HOTKEY__", _chosen_hotkey)
+
+    import webview
+
+    x, y, width, height, maximized = place_window()
+    _window = webview.create_window(
+        WINDOW_TITLE,
+        html=_page_html,
+        js_api=Api(),
+        width=width,
+        height=height,
+        x=x,
+        y=y,
+        resizable=True,
+        maximized=maximized,
+        on_top=True,
+        background_color="#14161c",
+        text_select=True,
+        zoomable=True,
+        min_size=(320, 360),
+    )
+    _window.events.shown += on_shown
+    webview.start(
+        gui="edgechromium",
+        private_mode=False,
+        storage_path=str(APP / "webview"),
+    )
+
+
+if __name__ == "__main__":
+    def _hook(exc_type, exc, tb):
+        log("".join(traceback.format_exception(exc_type, exc, tb)))
+        sys.__excepthook__(exc_type, exc, tb)
+
+    sys.excepthook = _hook
+    if hasattr(threading, "excepthook"):
+        def _thread_hook(args):
+            _hook(args.exc_type, args.exc_value, args.exc_traceback)
+
+        threading.excepthook = _thread_hook
+    main()
