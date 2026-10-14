@@ -232,7 +232,7 @@ class RegionPick:
                 self.cancel()
 
         def on_paint(sender, args):
-            text = "Hissa kheenchon. Esc se band."
+            text = "Drag a region. Esc cancels."
             brush = args.Graphics
             from System.Drawing import SolidBrush
             ink = SolidBrush(Color.FromArgb(255, 236, 228, 210))

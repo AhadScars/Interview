@@ -211,7 +211,7 @@ class PcView:
 
     def browse(self, path):
         if not self._browser:
-            raise RuntimeError("This PC abhi taiyar nahi")
+            raise RuntimeError("This PC is not ready")
         names = []
         if path:
             names.append(path)
@@ -223,7 +223,7 @@ class PcView:
             if item:
                 break
         if not item:
-            raise OSError("folder nahi khula: %s" % (path or "This PC"))
+            raise OSError("Could not open folder: %s" % (path or "This PC"))
         try:
             hr = _method(self._browser, 14, ctypes.c_long, (ctypes.c_void_p, ctypes.c_uint))(
                 self._browser, item, SBSP_ABSOLUTE
