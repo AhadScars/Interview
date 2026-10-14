@@ -19,7 +19,7 @@ from urllib.parse import quote
 
 APP = Path(os.environ.get("APPDATA", str(Path.home()))) / "Veil"
 NOTES = APP / "notes.txt"
-SHOTS = Path(os.environ.get("USERPROFILE") or str(Path.home()))
+SHOTS = Path(os.environ.get("USERPROFILE") or str(Path.home())) / "Pictures" / "Screenshots"
 LOG = APP / "veil.log"
 MUTEX_NAME = "Local\\VeilPrivateWindow"
 WINDOW_TITLE = "Veil"
@@ -724,7 +724,7 @@ def show_shot(path, bitmap):
         form._veil_shot_image.Image = bitmap
         if previous is not None:
             previous.Dispose()
-        form._veil_shot_label.Text = path.name + "   ·   " + path.parent.name
+        form._veil_shot_label.Text = path.name + "   ·   Pictures\\Screenshots"
         form.webview.Visible = False
         form._veil_shot_panel.Visible = True
         form._veil_shot_panel.BringToFront()
