@@ -2,6 +2,8 @@
 """Veil: a private window. Screen-capture APIs skip it, and it has no taskbar button.
 
 Run with pythonw.exe (the desktop shortcut does this). Ctrl+Alt+V hides and shows it.
+PC opens This PC inside the same window.
+Shot takes a silent full-screen or region screenshot.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ from urllib.parse import quote
 
 APP = Path(os.environ.get("APPDATA", str(Path.home()))) / "Veil"
 NOTES = APP / "notes.txt"
+SHOTS = Path(os.environ.get("USERPROFILE") or str(Path.home()))
 LOG = APP / "veil.log"
 MUTEX_NAME = "Local\\VeilPrivateWindow"
 WINDOW_TITLE = "Veil"
@@ -368,7 +371,7 @@ HOME_HTML = """<!DOCTYPE html>
       <div class="kicker">PRIVATE WINDOW</div>
       <h1>Sirf tumhari screen par</h1>
       <div class="status">Meeting ki screen share is window ko skip karti hai. Taskbar par button nahi. Alt+Tab mein nahi.</div>
-      <p class="hint">Chhupane aur wapas laane ke liye <kbd>__HOTKEY__</kbd>. Upar wali patti mein koi bhi site ya search likho. Notes neeche khud likho.</p>
+      <p class="hint">Chhupane aur wapas laane ke liye <kbd>__HOTKEY__</kbd>. PC se This PC. Shot se poora screen ya hissa, bina notification. Notes neeche khud likho.</p>
     </div>
     <textarea id="notes" spellcheck="false" placeholder="Meeting notes yahan likho."></textarea>
     <div class="row">
@@ -430,15 +433,33 @@ class Api:
     def go(self, url):
         target = normalize_url(url)
         if target and _window is not None:
+            close_pc()
             _window.load_url(target)
         return True
+
+
+def _folder_target(text):
+    raw = (text or "").strip().strip('"')
+    if len(raw) >= 3 and raw[1] == ":" and raw[2] in "\\/":
+        return raw.replace("/", "\\")
+    if raw.startswith("\\\\"):
+        return raw
+    return ""
 
 
 def navigate(url=None):
     form = _form
     if form is None:
         return
-    target = normalize_url(url if url is not None else form._veil_box.Text)
+    raw = form._veil_box.Text if url is None else url
+    folder = _folder_target(raw)
+    if folder:
+        close_shot()
+        open_pc(folder)
+        return
+    close_shot()
+    close_pc()
+    target = normalize_url(raw)
     if not target:
         return
     try:
@@ -463,6 +484,9 @@ def layout_bar(*_):
     form = _form
     if form is None or getattr(form, "_veil_laying", False):
         return
+    menu = getattr(form, "_veil_shot_menu", None)
+    if menu is not None and menu.Visible:
+        menu.Visible = False
     panel = form._veil_panel
     width = int(panel.ClientSize.Width)
     if width < 80:
@@ -479,19 +503,26 @@ def layout_bar(*_):
     go_w = px(48)
     home_w = px(62)
     pin_w = px(68)
+    pc_w = px(46)
+    shot_w = px(58)
     hide_w = px(58)
     url_min = px(128)
     one_row = (
-        pad * 2 + back_w + go_w + home_w + pin_w + hide_w + gap * 5 + url_min
+        pad * 2 + back_w + go_w + home_w + pc_w + shot_w + pin_w + hide_w + gap * 7 + url_min
     )
     two_rows = width < one_row
+    row2_need = pad * 2 + home_w + pc_w + shot_w + pin_w + hide_w + gap * 4
+    three_rows = two_rows and width < row2_need
+    rows = 3 if three_rows else (2 if two_rows else 1)
     form._veil_laying = True
     try:
-        panel.Height = (pad * 2 + row_h) if not two_rows else (pad * 2 + row_h * 2 + gap)
+        panel.Height = pad * 2 + row_h * rows + gap * (rows - 1)
         back = form._veil_back
         box = form._veil_box
         go = form._veil_go
         home = form._veil_home
+        pc = form._veil_pc
+        shot = form._veil_shot
         pin = form._veil_pin
         hide = form._veil_hide
         if two_rows:
@@ -501,15 +532,36 @@ def layout_bar(*_):
             url_left = pad + back_w + gap
             box.SetBounds(url_left, pad + px(2), max(px(48), go_x - gap - url_left), row_h - px(4))
             second = pad + row_h + gap
-            hide_x = width - pad - hide_w
-            hide.SetBounds(hide_x, second, hide_w, row_h)
-            pin_x = hide_x - gap - pin_w
-            pin.SetBounds(pin_x, second, pin_w, row_h)
-            home.SetBounds(pin_x - gap - home_w, second, home_w, row_h)
+            if three_rows:
+                hide_x = width - pad - hide_w
+                hide.SetBounds(hide_x, second, hide_w, row_h)
+                pin_x = hide_x - gap - pin_w
+                pin.SetBounds(pin_x, second, pin_w, row_h)
+                home.SetBounds(pin_x - gap - home_w, second, home_w, row_h)
+                third = second + row_h + gap
+                shot.SetBounds(width - pad - shot_w, third, shot_w, row_h)
+                pc.SetBounds(width - pad - shot_w - gap - pc_w, third, pc_w, row_h)
+            else:
+                hide_x = width - pad - hide_w
+                hide.SetBounds(hide_x, second, hide_w, row_h)
+                pin_x = hide_x - gap - pin_w
+                pin.SetBounds(pin_x, second, pin_w, row_h)
+                shot_x = pin_x - gap - shot_w
+                shot.SetBounds(shot_x, second, shot_w, row_h)
+                pc_x = shot_x - gap - pc_w
+                pc.SetBounds(pc_x, second, pc_w, row_h)
+                home.SetBounds(pc_x - gap - home_w, second, home_w, row_h)
         else:
             back.SetBounds(pad, pad, back_w, row_h)
             right = width - pad
-            for button, button_w in ((hide, hide_w), (pin, pin_w), (home, home_w), (go, go_w)):
+            for button, button_w in (
+                (hide, hide_w),
+                (pin, pin_w),
+                (shot, shot_w),
+                (pc, pc_w),
+                (home, home_w),
+                (go, go_w),
+            ):
                 right -= button_w
                 button.SetBounds(right, pad, button_w, row_h)
                 right -= gap
@@ -534,10 +586,209 @@ def paint_button(button, label):
     return button
 
 
+_place_actions = []
+
+
+def paint_pc(on):
+    form = _form
+    if form is None:
+        return
+    from System.Drawing import Color
+
+    button = form._veil_pc
+    if on:
+        button.BackColor = Color.FromArgb(255, 224, 177, 90)
+        button.ForeColor = Color.FromArgb(255, 28, 24, 16)
+    else:
+        button.BackColor = Color.FromArgb(255, 36, 34, 30)
+        button.ForeColor = Color.FromArgb(255, 236, 228, 210)
+    form._veil_pc_on = on
+
+
+def _on_place(name):
+    form = _form
+    if form is None or not form.IsHandleCreated or not name:
+        return
+    from System import Action
+
+    def apply(name=name):
+        current = _form
+        if current is not None and getattr(current, "_veil_pc_on", False):
+            current._veil_box.Text = name
+
+    action = Action(apply)
+    _place_actions.append(action)
+    if len(_place_actions) > 20:
+        del _place_actions[:-10]
+    try:
+        form.BeginInvoke(action)
+    except Exception:
+        log(traceback.format_exc())
+
+
+def open_pc(path=None):
+    form = _form
+    if form is None or _test or form._veil_files is None:
+        return
+    host = form._veil_files_panel
+    close_shot()
+    hide_shot_menu()
+    if not getattr(form, "_veil_pc_on", False):
+        current = form._veil_box.Text
+        if not _folder_target(current):
+            form._veil_web_text = current
+    try:
+        form.webview.Visible = False
+        host.Visible = True
+        host.BringToFront()
+        form._veil_panel.BringToFront()
+        form.PerformLayout()
+        form._veil_files.open(host, path)
+    except Exception:
+        log(traceback.format_exc())
+        host.Visible = False
+        try:
+            form.webview.Visible = True
+            form._veil_panel.BringToFront()
+        except Exception:
+            log(traceback.format_exc())
+        paint_pc(False)
+        return
+    paint_pc(True)
+    if path:
+        form._veil_box.Text = path
+    try:
+        shield_all()
+    except Exception:
+        log(traceback.format_exc())
+
+
+def close_pc():
+    form = _form
+    if form is None or not getattr(form, "_veil_pc_on", False):
+        return
+    try:
+        form._veil_files.hide()
+        form._veil_files_panel.Visible = False
+        form.webview.Visible = True
+        form._veil_panel.BringToFront()
+        form._veil_box.Text = getattr(form, "_veil_web_text", "") or ""
+    except Exception:
+        log(traceback.format_exc())
+    paint_pc(False)
+
+
+def toggle_pc():
+    if getattr(_form, "_veil_pc_on", False):
+        close_pc()
+        return
+    open_pc(None)
+
+
+def hide_shot_menu():
+    form = _form
+    menu = None if form is None else getattr(form, "_veil_shot_menu", None)
+    if menu is not None:
+        menu.Visible = False
+
+
+def close_shot():
+    form = _form
+    if form is None or not getattr(form, "_veil_shot_on", False):
+        return
+    form._veil_shot_on = False
+    try:
+        form._veil_shot_panel.Visible = False
+        picture = form._veil_shot_image
+        image = picture.Image
+        picture.Image = None
+        if image is not None:
+            image.Dispose()
+        if not getattr(form, "_veil_pc_on", False):
+            form.webview.Visible = True
+            form._veil_panel.BringToFront()
+    except Exception:
+        log(traceback.format_exc())
+
+
+def show_shot(path, bitmap):
+    form = _form
+    if form is None:
+        if bitmap is not None:
+            bitmap.Dispose()
+        return
+    close_pc()
+    hide_shot_menu()
+    try:
+        previous = form._veil_shot_image.Image
+        form._veil_shot_image.Image = bitmap
+        if previous is not None:
+            previous.Dispose()
+        form._veil_shot_label.Text = path.name + "   ·   " + path.parent.name
+        form.webview.Visible = False
+        form._veil_shot_panel.Visible = True
+        form._veil_shot_panel.BringToFront()
+        form._veil_panel.BringToFront()
+        form._veil_shot_on = True
+        form._veil_box.Text = str(path)
+    except Exception:
+        log(traceback.format_exc())
+        if bitmap is not None:
+            bitmap.Dispose()
+
+
+def take_shot(rect):
+    from veil_shot import save_capture
+
+    hide_shot_menu()
+    try:
+        path, bitmap = save_capture(rect[0], rect[1], rect[2], rect[3], SHOTS)
+    except Exception:
+        log(traceback.format_exc())
+        if _form is not None:
+            _form._veil_box.Text = "Screenshot nahi bana"
+        return
+    if path is None:
+        return
+    log("shot " + path.name)
+    show_shot(path, bitmap)
+
+
+def take_full_shot():
+    from veil_shot import virtual_screen
+
+    take_shot(virtual_screen())
+
+
+def take_region_shot():
+    form = _form
+    if form is None or _test:
+        return
+    hide_shot_menu()
+    picker = form._veil_picker
+    if picker is None:
+        from veil_shot import RegionPick
+
+        picker = RegionPick(lambda rect: take_shot(rect), lambda: None)
+        form._veil_picker = picker
+        _refs.append(picker)
+    if picker.active:
+        return
+    picker.start()
+
+
+def cancel_region():
+    form = _form
+    picker = None if form is None else getattr(form, "_veil_picker", None)
+    if picker is not None and picker.active:
+        picker.on_cancel = None
+        picker.cancel()
+
+
 def arm():
     global _form
     import System.Windows.Forms as WinForms
-    from System.Drawing import Color, Font
+    from System.Drawing import Color, ContentAlignment, Font, Size
 
     form = _form
     font = Font("Segoe UI", 9.0)
@@ -570,12 +821,16 @@ def arm():
     go = WinForms.Button()
     home = WinForms.Button()
     pin = WinForms.Button()
+    pc = WinForms.Button()
+    shot = WinForms.Button()
     hide = WinForms.Button()
     for button, label in (
         (back, "←"),
         (go, "Go"),
         (home, "Home"),
         (pin, "Unpin"),
+        (pc, "PC"),
+        (shot, "Shot"),
         (hide, "Hide"),
     ):
         paint_button(button, label)
@@ -583,9 +838,13 @@ def arm():
     panel.Controls.Add(box)
 
     def on_go(sender, args):
+        hide_shot_menu()
         navigate()
 
     def on_home(sender, args):
+        hide_shot_menu()
+        close_shot()
+        close_pc()
         box.Text = ""
         try:
             form.browser.load_html(_page_html, None)
@@ -593,6 +852,16 @@ def arm():
             log(traceback.format_exc())
 
     def on_back(sender, args):
+        hide_shot_menu()
+        if getattr(form, "_veil_shot_on", False):
+            close_shot()
+            return
+        if getattr(form, "_veil_pc_on", False):
+            try:
+                form._veil_files.back()
+            except Exception:
+                log(traceback.format_exc())
+            return
         try:
             if form.webview.CanGoBack:
                 form.webview.GoBack()
@@ -605,6 +874,31 @@ def arm():
 
     def on_hide(sender, args):
         form.Hide()
+
+    def on_pc(sender, args):
+        hide_shot_menu()
+        toggle_pc()
+
+    def on_shot(sender, args):
+        menu = form._veil_shot_menu
+        show = not menu.Visible
+        menu.Visible = show
+        if not show:
+            return
+        from System.Drawing import Point
+
+        origin = form.PointToClient(panel.PointToScreen(Point(shot.Left, shot.Bottom + 4)))
+        menu.Location = origin
+        menu.BringToFront()
+
+    def on_full(sender, args):
+        take_full_shot()
+
+    def on_part(sender, args):
+        take_region_shot()
+
+    def on_band(sender, args):
+        close_shot()
 
     def on_navigated(sender, args):
         try:
@@ -622,6 +916,8 @@ def arm():
     home.Click += on_home
     back.Click += on_back
     pin.Click += on_pin
+    pc.Click += on_pc
+    shot.Click += on_shot
     hide.Click += on_hide
     form._veil_panel = panel
     form._veil_box = box
@@ -629,22 +925,113 @@ def arm():
     form._veil_go = go
     form._veil_home = home
     form._veil_pin = pin
+    form._veil_pc = pc
+    form._veil_shot = shot
     form._veil_hide = hide
+    form._veil_pc_on = False
+    form._veil_shot_on = False
+    form._veil_files = None
+    form._veil_picker = None
     panel.Resize += layout_bar
     form.webview.NavigationCompleted += on_navigated
     _refs.extend([
-        panel, box, back, go, home, pin, hide, font,
-        on_enter, on_go, on_home, on_back, on_pin, on_hide, on_navigated,
+        panel, box, back, go, home, pin, pc, shot, hide, font,
+        on_enter, on_go, on_home, on_back, on_pin, on_pc, on_shot, on_hide, on_navigated,
+        on_full, on_part, on_band,
     ])
 
     try:
-        user32.SendMessageW(as_hwnd(box.Handle), EM_SETCUEBANNER, 1, "Site ya search — kuch bhi")
+        user32.SendMessageW(as_hwnd(box.Handle), EM_SETCUEBANNER, 1, "Site, search, ya folder path")
     except Exception:
         log(traceback.format_exc())
 
     tip = WinForms.ToolTip()
     tip.SetToolTip(hide, _chosen_hotkey + " se wapas aayega")
+    tip.SetToolTip(pc, "This PC isi window mein")
+    tip.SetToolTip(shot, "Poora screen ya hissa, bina notification")
     _refs.append(tip)
+
+    menu = WinForms.Panel()
+    menu.Visible = False
+    menu.Size = Size(148, 76)
+    menu.BackColor = Color.FromArgb(255, 28, 30, 36)
+    full = WinForms.Button()
+    part = WinForms.Button()
+    paint_button(full, "Poora")
+    paint_button(part, "Hissa")
+    full.SetBounds(6, 6, 136, 30)
+    part.SetBounds(6, 40, 136, 30)
+    full.Click += on_full
+    part.Click += on_part
+    menu.Controls.Add(full)
+    menu.Controls.Add(part)
+    form.Controls.Add(menu)
+    form._veil_shot_menu = menu
+
+    shots = WinForms.Panel()
+    shots.Dock = WinForms.DockStyle.Fill
+    shots.Visible = False
+    shots.BackColor = Color.FromArgb(255, 20, 21, 26)
+    header = WinForms.Panel()
+    header.Height = 36
+    header.Dock = WinForms.DockStyle.Top
+    header.BackColor = shots.BackColor
+    band = WinForms.Button()
+    paint_button(band, "Band")
+    band.Dock = WinForms.DockStyle.Right
+    band.Width = 72
+    band.Click += on_band
+    caption = WinForms.Label()
+    caption.Dock = WinForms.DockStyle.Fill
+    caption.ForeColor = Color.FromArgb(255, 224, 177, 90)
+    caption.BackColor = shots.BackColor
+    caption.Font = font
+    caption.TextAlign = ContentAlignment.MiddleLeft
+    caption.Padding = WinForms.Padding(10, 0, 0, 0)
+    picture = WinForms.PictureBox()
+    picture.Dock = WinForms.DockStyle.Fill
+    picture.SizeMode = WinForms.PictureBoxSizeMode.Zoom
+    picture.BackColor = shots.BackColor
+    header.Controls.Add(caption)
+    header.Controls.Add(band)
+    shots.Controls.Add(picture)
+    shots.Controls.Add(header)
+    form.Controls.Add(shots)
+    form._veil_shot_panel = shots
+    form._veil_shot_image = picture
+    form._veil_shot_label = caption
+    _refs.extend([menu, full, part, shots, header, band, caption, picture])
+
+    files = WinForms.Panel()
+    files.Dock = WinForms.DockStyle.Fill
+    files.Visible = False
+    files.BackColor = Color.White
+    form.Controls.Add(files)
+    form._veil_files_panel = files
+    if not _test:
+        from veil_files import PcView
+
+        form._veil_files = PcView(_on_place, log)
+
+        def on_files_resize(sender, args):
+            if form._veil_pc_on and form._veil_files is not None:
+                form._veil_files.sync(files)
+
+        files.Resize += on_files_resize
+        _refs.append(on_files_resize)
+    _refs.append(files)
+
+    def on_closed(sender, args):
+        cancel_region()
+        picker = form._veil_picker
+        if picker is not None:
+            picker.close()
+        view = form._veil_files
+        if view is not None:
+            view.close()
+
+    form.FormClosed += on_closed
+    _refs.append(on_closed)
 
     if _test:
         swatch = WinForms.Panel()
@@ -688,6 +1075,8 @@ def toggle():
     if form is None or not form.IsHandleCreated:
         return
     if form.Visible:
+        cancel_region()
+        hide_shot_menu()
         form.Hide()
         return
     import System.Windows.Forms as WinForms
