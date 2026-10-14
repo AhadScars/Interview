@@ -4,6 +4,7 @@
 Run with pythonw.exe (the desktop shortcut does this). Ctrl+Alt+V hides and shows it.
 PC opens This PC inside the same window.
 Shot takes a silent full-screen or region screenshot.
+If ChatGPT or Gemini is open in this window, the shot is pasted into its message box.
 """
 
 from __future__ import annotations
@@ -46,6 +47,97 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 ole32 = ctypes.WinDLL("ole32", use_last_error=True)
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+
+VK_CONTROL = 0x11
+VK_V = 0x56
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+
+CHATGPT_FOCUS_JS = """
+(function () {
+  var el = document.querySelector('#prompt-textarea')
+    || document.querySelector('div.ProseMirror[contenteditable="true"]')
+    || document.querySelector('[contenteditable="true"][role="textbox"]')
+    || document.querySelector('textarea');
+  if (!el) return 'missing';
+  el.focus();
+  try {
+    var sel = window.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch (e) {}
+  return 'ok';
+})()
+"""
+
+GEMINI_FOCUS_JS = """
+(function () {
+  var selectors = [
+    'rich-textarea .ql-editor[contenteditable="true"]',
+    'div.ql-editor[contenteditable="true"]',
+    '[aria-label="Enter a prompt here"]',
+    'rich-textarea [contenteditable="true"]',
+    'div[contenteditable="true"][role="textbox"]'
+  ];
+  var el = null;
+  for (var i = 0; i < selectors.length; i++) {
+    var found = document.querySelector(selectors[i]);
+    if (found) { el = found; break; }
+  }
+  if (!el) return 'missing';
+  el.focus();
+  try {
+    var sel = window.getSelection();
+    var range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch (e) {}
+  return 'ok';
+})()
+"""
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("union", _INPUTUNION)]
 
 
 class GUID(ctypes.Structure):
@@ -107,6 +199,12 @@ def _bind():
     user32.SendMessageW.restype = ctypes.c_ssize_t
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+    user32.SendInput.restype = wintypes.UINT
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
     kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.CreateMutexW.restype = wintypes.HANDLE
     kernel32.GetCurrentProcessId.restype = wintypes.DWORD
@@ -359,28 +457,27 @@ HOME_HTML = """<!DOCTYPE html>
   textarea:focus { border-color: #8a7040; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   button.link {
+    flex: 1 1 7.5rem; min-height: 34px; text-align: center;
     background: transparent; color: var(--ink); border: 1px solid var(--line);
-    border-radius: 999px; padding: 7px 12px; font: 13px "Segoe UI"; cursor: pointer;
+    border-radius: 999px; padding: 7px 12px; font: 600 13px "Segoe UI", sans-serif; cursor: pointer;
   }
   button.link:hover { border-color: var(--brass); color: var(--brass); }
+  button.link:focus-visible { outline: 1px solid var(--brass); outline-offset: 2px; }
 </style>
 </head>
 <body>
   <div class="wrap">
     <div>
       <div class="kicker">PRIVATE WINDOW</div>
-      <h1>Sirf tumhari screen par</h1>
-      <div class="status">Meeting ki screen share is window ko skip karti hai. Taskbar par button nahi. Alt+Tab mein nahi.</div>
-      <p class="hint">Chhupane aur wapas laane ke liye <kbd>__HOTKEY__</kbd>. PC se This PC. Shot se poora screen ya hissa, bina notification. Notes neeche khud likho.</p>
+      <h1>Only on your screen</h1>
+      <div class="status">Screen share skips this window. It stays off the taskbar and Alt+Tab.</div>
+      <p class="hint">Press <kbd>__HOTKEY__</kbd> to hide or show it. PC browses this computer. Shot takes the full screen or a region, with no notification. When ChatGPT or Gemini is open here, the image is pasted into the message box.</p>
     </div>
-    <textarea id="notes" spellcheck="false" placeholder="Meeting notes yahan likho."></textarea>
+    <textarea id="notes" spellcheck="false" placeholder="Write notes here."></textarea>
     <div class="row">
       <button class="link" data-url="https://chatgpt.com">ChatGPT</button>
-      <button class="link" data-url="https://www.google.com">Google</button>
-      <button class="link" data-url="https://mail.google.com">Gmail</button>
       <button class="link" data-url="https://gemini.google.com">Gemini</button>
-      
-      
+      <button class="link" data-url="https://www.google.com">Google</button>
     </div>
   </div>
   <script>
@@ -737,6 +834,135 @@ def show_shot(path, bitmap):
             bitmap.Dispose()
 
 
+def _page_url(form):
+    try:
+        source = form.webview.Source
+        if source is not None:
+            return str(source.AbsoluteUri)
+    except Exception:
+        pass
+    try:
+        return form._veil_box.Text or ""
+    except Exception:
+        return ""
+
+
+def _composer_script(form):
+    if form is None or getattr(form, "_veil_pc_on", False):
+        return None
+    url = _page_url(form).lower()
+    if "chatgpt.com" in url or "chat.openai.com" in url:
+        return CHATGPT_FOCUS_JS
+    if "gemini.google.com" in url:
+        return GEMINI_FOCUS_JS
+    return None
+
+
+def _copy_image(bitmap):
+    import System.Windows.Forms as WinForms
+    from System.Drawing.Imaging import ImageFormat
+    from System.IO import MemoryStream
+
+    stream = MemoryStream()
+    try:
+        bitmap.Save(stream, ImageFormat.Png)
+        stream.Position = 0
+        data = WinForms.DataObject()
+        data.SetImage(bitmap)
+        data.SetData("PNG", False, stream)
+        WinForms.Clipboard.SetDataObject(data, True)
+    finally:
+        stream.Dispose()
+
+
+def _focus_veil(form):
+    hwnd = as_hwnd(form.Handle)
+    foreground = user32.GetForegroundWindow()
+    current = kernel32.GetCurrentThreadId()
+    other = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+    attached = False
+    if other and other != current:
+        attached = bool(user32.AttachThreadInput(current, other, True))
+    try:
+        user32.SetForegroundWindow(hwnd)
+        form.Activate()
+        form.webview.Focus()
+    finally:
+        if attached:
+            user32.AttachThreadInput(current, other, False)
+
+
+def _send_ctrl_v():
+    keys = (INPUT * 4)()
+    sequence = (
+        (VK_CONTROL, 0),
+        (VK_V, 0),
+        (VK_V, KEYEVENTF_KEYUP),
+        (VK_CONTROL, KEYEVENTF_KEYUP),
+    )
+    for index, (vk, flags) in enumerate(sequence):
+        key = KEYBDINPUT()
+        key.wVk = vk
+        key.dwFlags = flags
+        keys[index].type = INPUT_KEYBOARD
+        keys[index].union.ki = key
+    sent = user32.SendInput(4, keys, ctypes.sizeof(INPUT))
+    if sent != 4:
+        log("paste keys sent %s" % sent)
+
+
+def _queue_composer_paste(form, bitmap, script):
+    import System.Windows.Forms as WinForms
+
+    close_shot()
+    form.webview.Visible = True
+    form._veil_panel.BringToFront()
+    _focus_veil(form)
+    try:
+        form.webview.CoreWebView2.ExecuteScriptAsync(script)
+    except Exception:
+        log(traceback.format_exc())
+    previous = getattr(form, "_veil_paste_timer", None)
+    if previous is not None:
+        try:
+            previous.Stop()
+            previous.Dispose()
+        except Exception:
+            pass
+    form._veil_paste_gen = getattr(form, "_veil_paste_gen", 0) + 1
+    generation = form._veil_paste_gen
+    timer = WinForms.Timer()
+    timer.Interval = 400
+
+    def tick(sender, args):
+        timer.Stop()
+        try:
+            timer.Dispose()
+        except Exception:
+            pass
+        if getattr(form, "_veil_paste_gen", 0) != generation:
+            try:
+                bitmap.Dispose()
+            except Exception:
+                pass
+            return
+        try:
+            _focus_veil(form)
+            _send_ctrl_v()
+            log("composer paste")
+        except Exception:
+            log(traceback.format_exc())
+        try:
+            bitmap.Dispose()
+        except Exception:
+            pass
+
+    timer.Tick += tick
+    form._veil_paste_timer = timer
+    _refs.append(tick)
+    timer.Start()
+
+
 def take_shot(rect):
     from veil_shot import save_capture
 
@@ -746,11 +972,20 @@ def take_shot(rect):
     except Exception:
         log(traceback.format_exc())
         if _form is not None:
-            _form._veil_box.Text = "Screenshot nahi bana"
+            _form._veil_box.Text = "Couldn't save the screenshot"
         return
     if path is None:
         return
     log("shot " + path.name)
+    form = _form
+    script = _composer_script(form)
+    if script:
+        try:
+            _copy_image(bitmap)
+            _queue_composer_paste(form, bitmap, script)
+            return
+        except Exception:
+            log(traceback.format_exc())
     show_shot(path, bitmap)
 
 
@@ -941,26 +1176,26 @@ def arm():
     ])
 
     try:
-        user32.SendMessageW(as_hwnd(box.Handle), EM_SETCUEBANNER, 1, "Site, search, ya folder path")
+        user32.SendMessageW(as_hwnd(box.Handle), EM_SETCUEBANNER, 1, "Site, search, or folder path")
     except Exception:
         log(traceback.format_exc())
 
     tip = WinForms.ToolTip()
-    tip.SetToolTip(hide, _chosen_hotkey + " se wapas aayega")
-    tip.SetToolTip(pc, "This PC isi window mein")
-    tip.SetToolTip(shot, "Poora screen ya hissa, bina notification")
+    tip.SetToolTip(hide, _chosen_hotkey + " shows it again")
+    tip.SetToolTip(pc, "Browse this PC in this window")
+    tip.SetToolTip(shot, "Full screen or a region, no notification")
     _refs.append(tip)
 
     menu = WinForms.Panel()
     menu.Visible = False
-    menu.Size = Size(148, 76)
+    menu.Size = Size(168, 76)
     menu.BackColor = Color.FromArgb(255, 28, 30, 36)
     full = WinForms.Button()
     part = WinForms.Button()
-    paint_button(full, "Poora")
-    paint_button(part, "Hissa")
-    full.SetBounds(6, 6, 136, 30)
-    part.SetBounds(6, 40, 136, 30)
+    paint_button(full, "Full screen")
+    paint_button(part, "Region")
+    full.SetBounds(6, 6, 156, 30)
+    part.SetBounds(6, 40, 156, 30)
     full.Click += on_full
     part.Click += on_part
     menu.Controls.Add(full)
@@ -977,7 +1212,7 @@ def arm():
     header.Dock = WinForms.DockStyle.Top
     header.BackColor = shots.BackColor
     band = WinForms.Button()
-    paint_button(band, "Band")
+    paint_button(band, "Close")
     band.Dock = WinForms.DockStyle.Right
     band.Width = 72
     band.Click += on_band
