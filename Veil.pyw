@@ -11,6 +11,8 @@ The pointer stays the normal arrow over text, links, and buttons. Windows draws 
 pointer on top of a capture, so a changing pointer would still show on a screen share.
 Coming here from a full-screen app keeps the taskbar down. Explorer would otherwise
 pop it up, and that pop shows on a capture.
+Switching between this window and the shared one does not flash the caption buttons.
+Close, minimize, and maximize stay the same color both ways.
 """
 
 from __future__ import annotations
@@ -43,7 +45,16 @@ SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 WM_HOTKEY = 0x0312
+WM_ACTIVATE = 0x0006
+WM_NCACTIVATE = 0x0086
+WM_MOUSEACTIVATE = 0x0021
+WM_SETREDRAW = 0x000B
+WA_INACTIVE = 0
 WM_SETCURSOR = 0x0020
+DWMWA_TRANSITIONS_FORCEDISABLED = 3
+SMTO_ABORTIFHUNG = 0x0002
+WH_CALLWNDPROC = 4
+WH_MOUSE_LL = 14
 WH_CALLWNDPROCRET = 12
 GA_ROOT = 2
 IDC_ARROW = 32512
@@ -1110,6 +1121,7 @@ def _ensure_cursor_timer(form):
     def on_cursor(_sender, _args):
         _nudge_arrow()
         _sync_taskbar()
+        _sync_caption()
 
     timer.Tick += on_cursor
     form._veil_cursor_timer = timer
@@ -1804,7 +1816,511 @@ def _release_move_if_let_go(form):
     _end_plain_move(hwnd, save=True)
 
 
+_send_timeout_fn = None
+_dwm = None
+_caption_held = 0
+_caption_painted = 0
+_caption_release_at = 0.0
+_caption_ping_at = 0.0
+_caption_muted = set()
+_caption_lock = 0
+_redraw_frozen = 0
+_redraw_since = 0.0
+_caption_guard_at = 0.0
+_caption_in_activate = False
+_caption_hold_depth = 0
+_lock_bound = False
+_caption_busy = False
+_caption_call_hook = None
+_caption_call_cb = None
+_caption_mouse_hook = None
+_caption_mouse_cb = None
+
+
+class _CWPSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("lParam", ctypes.c_ssize_t),
+        ("wParam", ctypes.c_ssize_t),
+        ("message", wintypes.UINT),
+        ("hwnd", wintypes.HWND),
+    ]
+
+
+_CWP_MSG = _CWPSTRUCT.message.offset
+_CWP_HWND = _CWPSTRUCT.hwnd.offset
+_CAPTION_CLICKS = frozenset((0x0201, 0x0204, 0x0207, 0x020B))
+
+
+def _send_timeout(hwnd, msg, wparam, lparam, wait_ms=80):
+    global _send_timeout_fn
+    if _send_timeout_fn is None:
+        proto = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_ssize_t),
+        )
+        _send_timeout_fn = proto(("SendMessageTimeoutW", user32))
+    result = ctypes.c_ssize_t()
+    if not _send_timeout_fn(
+        hwnd, msg, wparam, lparam, SMTO_ABORTIFHUNG, wait_ms, ctypes.byref(result)
+    ):
+        return None
+    return int(result.value)
+
+
+def _set_transitions(hwnd, disabled):
+    """Stop the caption-button fade. The attribute is per window, so it is put back."""
+    global _dwm
+    if _dwm is None:
+        try:
+            _dwm = ctypes.WinDLL("dwmapi")
+            _dwm.DwmSetWindowAttribute.argtypes = [
+                wintypes.HWND, ctypes.c_uint, ctypes.c_void_p, ctypes.c_uint,
+            ]
+            _dwm.DwmSetWindowAttribute.restype = ctypes.c_long
+        except Exception:
+            _dwm = False
+    if _dwm is False or not hwnd:
+        return False
+    flag = ctypes.c_int(1 if disabled else 0)
+    hr = _dwm.DwmSetWindowAttribute(
+        hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, ctypes.byref(flag), ctypes.sizeof(flag)
+    )
+    hwnd = as_hwnd(hwnd)
+    if disabled and hr == 0 and not _veil_hwnd(hwnd):
+        _caption_muted.add(hwnd)
+    elif not disabled:
+        _caption_muted.discard(hwnd)
+    return hr == 0
+
+
+def _caption_target(hwnd):
+    if not hwnd:
+        return 0
+    try:
+        _bind_taskbar()
+    except Exception:
+        return 0
+    hwnd = as_hwnd(hwnd)
+    if not hwnd or not user32.IsWindow(hwnd) or _veil_hwnd(hwnd):
+        return 0
+    try:
+        root = user32.GetAncestor(hwnd, GA_ROOT)
+        if root:
+            hwnd = as_hwnd(root)
+    except Exception:
+        pass
+    if not hwnd or _veil_hwnd(hwnd):
+        return 0
+    if class_name(hwnd) in (
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+    ):
+        return 0
+    try:
+        if user32.IsIconic(hwnd) or not user32.IsWindowVisible(hwnd):
+            return 0
+    except Exception:
+        return 0
+    return hwnd
+
+
+def _arm_guard():
+    global _caption_guard_at
+    if not _caption_guard_at:
+        _caption_guard_at = time.monotonic()
+
+
+def _clear_guard():
+    global _caption_guard_at
+    if not _redraw_frozen and not _caption_lock:
+        _caption_guard_at = 0.0
+
+
+def _hold_caption(hwnd, repaint, wait_ms=80):
+    """Keep Close / Minimize / Maximize on the active color. -1 does not repaint."""
+    global _caption_held, _caption_painted, _caption_release_at, _caption_ping_at
+    if _test:
+        return
+    hwnd = _caption_target(hwnd)
+    if not hwnd:
+        return
+    try:
+        _set_transitions(hwnd, True)
+        sent = _send_timeout(hwnd, WM_NCACTIVATE, 1, 0 if repaint else -1, wait_ms)
+    except Exception:
+        log(traceback.format_exc())
+        return
+    if sent is None:
+        return
+    _caption_held = hwnd
+    _caption_release_at = 0.0
+    _caption_ping_at = time.monotonic()
+    if repaint:
+        _caption_painted = hwnd
+        if not getattr(_hold_caption, "logged", False):
+            _hold_caption.logged = True
+            log("caption held")
+
+
+def _freeze_redraw(hwnd):
+    global _redraw_frozen, _redraw_since
+    if not hwnd or _redraw_frozen or _test:
+        return False
+    try:
+        if _send_timeout(hwnd, WM_SETREDRAW, 0, 0, 20) is None:
+            return False
+    except Exception:
+        log(traceback.format_exc())
+        return False
+    _redraw_frozen = hwnd
+    _redraw_since = time.monotonic()
+    _arm_guard()
+    return True
+
+
+def _thaw_redraw():
+    global _redraw_frozen, _caption_guard_at
+    hwnd = _redraw_frozen
+    if not hwnd:
+        return
+    ok = False
+    try:
+        if not user32.IsWindow(hwnd):
+            ok = True
+        else:
+            ok = _send_timeout(hwnd, WM_SETREDRAW, 1, 0, 20) is not None
+    except Exception:
+        log(traceback.format_exc())
+    if not ok:
+        # A hung window must not be poked on every timer tick.
+        if time.monotonic() - _redraw_since > 1.0:
+            _redraw_frozen = 0
+            _clear_guard()
+            log("caption redraw restore gave up")
+        else:
+            _caption_guard_at = time.monotonic()
+        return
+    _redraw_frozen = 0
+    _clear_guard()
+
+
+def _release_frozen_caption():
+    global _caption_held, _caption_painted, _caption_release_at, _caption_ping_at
+    _thaw_redraw()
+    _unlock_window()
+    hwnds = list(_caption_muted)
+    held = _caption_held
+    _caption_held = 0
+    _caption_painted = 0
+    _caption_release_at = 0.0
+    _caption_ping_at = 0.0
+    if held:
+        hwnds.append(held)
+    seen = set()
+    for hwnd in hwnds:
+        if not hwnd or hwnd in seen:
+            continue
+        seen.add(hwnd)
+        try:
+            if user32.IsWindow(hwnd):
+                _set_transitions(hwnd, False)
+        except Exception:
+            log(traceback.format_exc())
+    _caption_muted.clear()
+
+
+def _lock_window(hwnd):
+    global _lock_bound, _caption_lock
+    if not hwnd or _caption_lock or _test:
+        return False
+    try:
+        if not _lock_bound:
+            user32.LockWindowUpdate.argtypes = [wintypes.HWND]
+            user32.LockWindowUpdate.restype = wintypes.BOOL
+            _lock_bound = True
+        if not user32.LockWindowUpdate(hwnd):
+            return False
+    except Exception:
+        return False
+    _caption_lock = hwnd
+    _arm_guard()
+    return True
+
+
+def _unlock_window():
+    global _caption_lock
+    if not _caption_lock:
+        return
+    try:
+        user32.LockWindowUpdate(0)
+    except Exception:
+        pass
+    _caption_lock = 0
+    _clear_guard()
+
+
+def _finish_other_caption(other):
+    """Paint the active caption once, after redraw is allowed again."""
+    need = bool(_redraw_frozen or _caption_lock)
+    frozen = _redraw_frozen
+    _thaw_redraw()
+    target = _caption_target(other) or _caption_target(frozen)
+    if target and (need or _caption_painted != target):
+        _hold_caption(target, repaint=True)
+    _unlock_window()
+
+
+def _schedule_caption_release():
+    global _caption_release_at
+    if not _caption_release_at:
+        _caption_release_at = time.monotonic() + 0.35
+
+
+def _veil_focused():
+    form = _form
+    try:
+        return bool(
+            form is not None
+            and form.IsHandleCreated
+            and form.Visible
+            and _veil_hwnd(user32.GetForegroundWindow())
+        )
+    except Exception:
+        return False
+
+
+def _point_in_veil(x, y):
+    form = _form
+    try:
+        if form is None or not form.IsHandleCreated:
+            return False
+        left, top, width, height = _window_rect(as_hwnd(form.Handle))
+    except Exception:
+        return False
+    return width > 0 and height > 0 and left <= x < left + width and top <= y < top + height
+
+
+def _prime_caption(hwnd):
+    """Call before Veil takes focus, while the other window still looks active."""
+    if _test:
+        return
+    other = _caption_target(hwnd)
+    if not other:
+        return
+    try:
+        _set_transitions(other, True)
+    except Exception:
+        log(traceback.format_exc())
+    _freeze_redraw(other)
+    _lock_window(other)
+
+
+def _sync_caption():
+    global _caption_release_at, _caption_held
+    if (
+        _caption_guard_at
+        and not _caption_hold_depth
+        and time.monotonic() - _caption_guard_at > 0.1
+    ):
+        stale = _redraw_frozen or _caption_lock
+        _finish_other_caption(stale if _veil_focused() else 0)
+    if _test:
+        return
+    if _veil_focused():
+        _caption_release_at = 0.0
+        other = _caption_target(_last_other)
+        if other and _caption_painted != other:
+            _hold_caption(other, repaint=True)
+            return
+        if _caption_held and not _caption_target(_caption_held):
+            _caption_held = 0
+            return
+        if _caption_held and time.monotonic() - _caption_ping_at >= 0.5:
+            _hold_caption(_caption_held, repaint=False, wait_ms=20)
+        return
+    if not _caption_held and not _caption_muted:
+        return
+    now = time.monotonic()
+    if not _caption_release_at:
+        _caption_release_at = now + 0.35
+    if now >= _caption_release_at:
+        _release_frozen_caption()
+
+
+def _on_activate_message(hwnd, wparam, lparam):
+    global _last_other, _caption_painted, _caption_in_activate
+    if _caption_in_activate:
+        pair = _move_hooks.get(hwnd)
+        if pair:
+            return user32.CallWindowProcW(pair[1], hwnd, WM_ACTIVATE, wparam, lparam)
+        return 0
+    active = (int(wparam) & 0xFFFF) != WA_INACTIVE
+    other = _caption_target(lparam) or _caption_target(_last_other)
+    if other and not _test:
+        try:
+            _set_transitions(other, True)
+        except Exception:
+            log(traceback.format_exc())
+    pair = _move_hooks.get(hwnd)
+    result = 0
+    _caption_in_activate = True
+    try:
+        if pair:
+            result = user32.CallWindowProcW(pair[1], hwnd, WM_ACTIVATE, wparam, lparam)
+        if not _test:
+            if active:
+                _finish_other_caption(other)
+            else:
+                if other:
+                    _last_other = other
+                if _redraw_frozen or _caption_lock:
+                    _finish_other_caption(0)
+                # Next entry has to paint again. The shared window was really activated.
+                _caption_painted = 0
+                _schedule_caption_release()
+    finally:
+        _caption_in_activate = False
+        _unlock_window()
+    return result
+
+
+def _caption_before_activate(hwnd):
+    """Same-thread clicks reach here before the other window is deactivated."""
+    if _test or _caption_busy or not hwnd or not _veil_hwnd(hwnd) or _veil_focused():
+        return
+    other = _caption_target(user32.GetForegroundWindow()) or _caption_target(_last_other)
+    if not other:
+        return
+    try:
+        _set_transitions(other, True)
+    except Exception:
+        return
+    _freeze_redraw(other)
+    _lock_window(other)
+
+
+def _caption_call_proc(nCode, wParam, lParam):
+    if nCode >= 0 and lParam and not _test:
+        try:
+            if ctypes.c_uint.from_address(lParam + _CWP_MSG).value == WM_MOUSEACTIVATE:
+                hwnd = ctypes.c_void_p.from_address(lParam + _CWP_HWND).value or 0
+                _caption_before_activate(hwnd)
+        except Exception:
+            pass
+    hook = _caption_call_hook
+    if not hook:
+        return 0
+    return user32.CallNextHookEx(hook, nCode, wParam, lParam)
+
+
+def _caption_before_click(x, y):
+    """Page clicks land in WebView2, so they never reach our window procedure."""
+    global _caption_busy
+    if _caption_busy or _test:
+        return
+    _caption_busy = True
+    try:
+        form = _form
+        if form is None or not form.IsHandleCreated or not form.Visible:
+            return
+        inside = _point_in_veil(x, y)
+        fg = user32.GetForegroundWindow()
+        if _veil_hwnd(fg):
+            if inside:
+                return
+            target = _caption_target(user32.WindowFromPoint(_POINT(int(x), int(y))))
+            if target:
+                _set_transitions(target, True)
+            return
+        if not inside:
+            return
+        other = _caption_target(fg) or _caption_target(_last_other)
+        if not other:
+            return
+        _set_transitions(other, True)
+        _freeze_redraw(other)
+        _lock_window(other)
+    except Exception:
+        return
+    finally:
+        _caption_busy = False
+
+
+def _caption_mouse_proc(nCode, wParam, lParam):
+    if nCode >= 0 and lParam and (int(wParam) & 0xFFFFFFFF) in _CAPTION_CLICKS:
+        try:
+            pt = _POINT.from_address(int(lParam))
+            _caption_before_click(int(pt.x), int(pt.y))
+        except Exception:
+            pass
+    hook = _caption_mouse_hook
+    if not hook:
+        return 0
+    return user32.CallNextHookEx(hook, nCode, wParam, lParam)
+
+
+def _ensure_caption_hooks():
+    global _caption_call_hook, _caption_call_cb, _caption_mouse_hook, _caption_mouse_cb
+    if _test or (_caption_call_hook and _caption_mouse_hook):
+        return
+    _bind_cursor_apis()
+    try:
+        _bind_taskbar()
+    except Exception:
+        log(traceback.format_exc())
+    _set_transitions(0, True)
+    if _caption_call_cb is None:
+        _caption_call_cb = _CURSOR_HOOK(_caption_call_proc)
+        _refs.append(_caption_call_cb)
+    if _caption_mouse_cb is None:
+        _caption_mouse_cb = _CURSOR_HOOK(_caption_mouse_proc)
+        _refs.append(_caption_mouse_cb)
+    if not _caption_call_hook:
+        hook = user32.SetWindowsHookExW(
+            WH_CALLWNDPROC, _caption_call_cb, None, kernel32.GetCurrentThreadId()
+        )
+        if hook:
+            _caption_call_hook = hook
+        else:
+            log("caption call hook failed err=%s" % ctypes.get_last_error())
+    if not _caption_mouse_hook:
+        hook = user32.SetWindowsHookExW(WH_MOUSE_LL, _caption_mouse_cb, None, 0)
+        if hook:
+            _caption_mouse_hook = hook
+        else:
+            log("caption mouse hook failed err=%s" % ctypes.get_last_error())
+
+
+def _remove_caption_hooks():
+    global _caption_call_hook, _caption_mouse_hook
+    for name in ("_caption_call_hook", "_caption_mouse_hook"):
+        hook = globals().get(name)
+        globals()[name] = None
+        if not hook:
+            continue
+        try:
+            user32.UnhookWindowsHookEx(hook)
+        except Exception:
+            log(traceback.format_exc())
+
+
 def _on_move_message(hwnd, msg, wparam, lparam):
+    if msg == WM_NCACTIVATE and (int(wparam) & 0xFFFF) == WA_INACTIVE:
+        # Stay on the active caption colors. Otherwise Close and Minimize dim.
+        pair = _move_hooks.get(hwnd)
+        if not pair:
+            return 1
+        return user32.CallWindowProcW(pair[1], hwnd, msg, 1, -1)
+    if msg == WM_ACTIVATE:
+        return _on_activate_message(hwnd, wparam, lparam)
     if msg == WM_NCDESTROY:
         form = _move_forms.pop(hwnd, None)
         _stop_drag_timer(form)
@@ -1891,6 +2407,10 @@ def _ensure_move_hook(form):
     hwnd = as_hwnd(form.Handle)
     _move_forms[hwnd] = form
     _ensure_drag_timer(form)
+    try:
+        _ensure_caption_hooks()
+    except Exception:
+        log(traceback.format_exc())
     if _move_cb is None:
         _move_cb = WNDPROC(_move_proc)
     current = _current_proc(hwnd)
@@ -1902,6 +2422,10 @@ def _ensure_move_hook(form):
         log("plain move hook failed err=%s" % ctypes.get_last_error())
         return
     _move_hooks[hwnd] = (_move_cb, previous)
+    try:
+        _set_transitions(hwnd, True)
+    except Exception:
+        log(traceback.format_exc())
 
 
 def arm():
@@ -2165,6 +2689,8 @@ def arm():
     _refs.append(files)
 
     def on_closed(sender, args):
+        _release_frozen_caption()
+        _remove_caption_hooks()
         _restore_taskbar()
         _remove_cursor_hook()
         cancel_region()
@@ -2230,13 +2756,21 @@ def arm():
 
 
 def toggle():
+    global _caption_hold_depth
     form = _form
     if form is None or not form.IsHandleCreated:
         return
     if form.Visible:
         cancel_region()
         hide_shot_menu()
+        other = _caption_target(_caption_held) or _caption_target(_last_other)
+        if other:
+            try:
+                _set_transitions(other, True)
+            except Exception:
+                log(traceback.format_exc())
         form.Hide()
+        _schedule_caption_release()
         _sync_taskbar()
         return
     import System.Windows.Forms as WinForms
@@ -2244,10 +2778,16 @@ def toggle():
     _remember_outside()
     if _cover_fullscreen:
         _hide_taskbars()
-    form.Show()
-    form.WindowState = WinForms.FormWindowState.Normal
-    form.TopMost = True
-    form.Activate()
+    _caption_hold_depth += 1
+    try:
+        _prime_caption(_last_other)
+        form.Show()
+        form.WindowState = WinForms.FormWindowState.Normal
+        form.TopMost = True
+        form.Activate()
+    finally:
+        _finish_other_caption(_last_other)
+        _caption_hold_depth -= 1
     try:
         shield_all(force_tab=True)
     except Exception:
@@ -2296,6 +2836,12 @@ def on_shown():
     from System import Action
 
     _form = _window.native
+    try:
+        _ensure_cursor_timer(_form)
+        _ensure_move_hook(_form)
+        _hold_caption(_last_other, repaint=True)
+    except Exception:
+        log(traceback.format_exc())
     _sync_taskbar()
     try:
         _form.BeginInvoke(Action(arm))
@@ -2667,6 +3213,12 @@ def main():
     _theme = _read_theme()
     _render_home()
     _remember_outside()
+    try:
+        outside = _caption_target(_last_other)
+        if outside:
+            _set_transitions(outside, True)
+    except Exception:
+        log(traceback.format_exc())
     if _cover_fullscreen:
         _hide_taskbars()
 
@@ -2697,6 +3249,14 @@ def main():
             storage_path=str(APP / "webview"),
         )
     finally:
+        try:
+            _release_frozen_caption()
+        except Exception:
+            log(traceback.format_exc())
+        try:
+            _remove_caption_hooks()
+        except Exception:
+            log(traceback.format_exc())
         _restore_taskbar()
 
 
